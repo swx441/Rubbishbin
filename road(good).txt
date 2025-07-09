@@ -1,0 +1,359 @@
+import cv2
+import numpy as np
+import matplotlib.pyplot as plt
+import threading
+import time
+from queue import Queue
+import subprocess
+from collections import deque
+import os
+
+plt.rcParams["axes.facecolor"] = "white"
+plt.rcParams["figure.facecolor"] = "white"
+
+RDK_X5_IP = "192.168.244.86"
+RTSP_PORT = 8554
+RTMP_PORT = 1935
+FRAME_SIZE = (640, 640)    
+RTMP_URL = f"rtmp://{RDK_X5_IP}:{RTMP_PORT}/live/mystream"
+PUSH_FPS = 25             
+SHOW_FPS = 15             
+MATPLOTLIB_UPDATE_INTERVAL = 0.5  
+
+LINE_WIDTH = 5            
+MIN_LINE_DIST = 15        
+MIN_FILL_AREA = 100       
+LINE_COLOR = 'black'      
+FILL_COLOR = 'black'      
+
+class RDKCamera:
+    def __init__(self, ip=RDK_X5_IP, port=RTSP_PORT):
+        self.rtsp_url = f"rtsp://{ip}:{port}/mystream"
+        self.cap = None
+        self.buffer = deque(maxlen=3)
+        self.running = False
+        self.thread = None
+        self.start()
+
+    def _connect(self):
+        try:
+            if self.cap is None or not self.cap.isOpened():
+                self.cap = cv2.VideoCapture(self.rtsp_url, cv2.CAP_FFMPEG)
+                if not self.cap.isOpened():
+                    raise RuntimeError(f"无法连接摄像头: {self.rtsp_url}")
+                self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_SIZE[0])
+                self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_SIZE[1])
+                print("摄像头连接成功")
+                return True
+        except Exception as e:
+            print(f"连接错误: {e}")
+            return False
+
+    def _read_frames(self):
+        while self.running:
+            if not self._connect():
+                time.sleep(1)
+                continue
+            while self.running and self.cap.isOpened():
+                ret, frame = self.cap.read()
+                if not ret:
+                    self.cap.release()
+                    self.cap = None
+                    continue
+                self.buffer.append(frame)
+                time.sleep(0.01)
+
+    def start(self):
+        self.running = True
+        self.thread = threading.Thread(target=self._read_frames, daemon=True)
+        self.thread.start()
+        print("摄像头线程启动")
+
+    def get_frame(self):
+        return self.buffer[-1] if self.buffer else None
+
+    def stop(self):
+        self.running = False
+        if self.thread:
+            self.thread.join(timeout=2.0)
+        if self.cap and self.cap.isOpened():
+            self.cap.release()
+
+class FFmpegPusher:
+    def __init__(self, rtmp_url=RTMP_URL, frame_size=FRAME_SIZE, fps=PUSH_FPS):
+        self.rtmp_url = rtmp_url
+        self.frame_size = frame_size
+        self.fps = fps
+        self.process = None
+        self.buffer = Queue(maxsize=5)
+        self.running = False
+        self.start()
+
+    def _init_process(self):
+        command = [
+            'ffmpeg', '-y', '-f', 'rawvideo',
+            '-vcodec', 'rawvideo', '-pix_fmt', 'bgr24',
+            '-s', f'{self.frame_size[0]}x{self.frame_size[1]}', '-r', str(self.fps),
+            '-i', '-', '-c:v', 'libx264',
+            '-preset', 'ultrafast', '-tune', 'zerolatency',
+            '-b:v', '1500k', '-maxrate', '2000k', '-bufsize', '1000k',
+            '-f', 'flv', self.rtmp_url
+        ]
+        try:
+            self.process = subprocess.Popen(command, stdin=subprocess.PIPE)
+            print(f"FFmpeg推流启动: {self.rtmp_url}")
+            return True
+        except Exception as e:
+            print(f"FFmpeg启动失败: {e}")
+            return False
+
+    def _push_frames(self):
+        while self.running:
+            if not self.process or self.process.poll() is not None:
+                if not self._init_process():
+                    time.sleep(1)
+                    continue
+            try:
+                frame = self.buffer.get(timeout=0.1)
+                self.process.stdin.write(frame.tobytes())
+            except:
+                pass
+
+    def push_frame(self, frame):
+        if self.buffer.full():
+            self.buffer.get_nowait()
+        self.buffer.put_nowait(frame)
+
+    def start(self):
+        self.running = True
+        threading.Thread(target=self._push_frames, daemon=True).start()
+        print("推流线程启动")
+
+    def stop(self):
+        self.running = False
+        if self.process:
+            self.process.stdin.close()
+            self.process.terminate()
+            self.process.wait(timeout=2.0)
+
+class StreetMapper:
+    def __init__(self, canvas_size=FRAME_SIZE):
+        self.canvas_size = canvas_size
+        self.M = None
+        self.calibration_points = []
+
+    def calibrate(self, points):
+        if len(points) != 4:
+            raise ValueError("需提供4个校准点")
+        src = np.float32(points)
+        dst = np.float32([[0, 0], [self.canvas_size[0], 0], 
+                          [self.canvas_size[0], self.canvas_size[1]], [0, self.canvas_size[1]]])
+        self.M = cv2.getPerspectiveTransform(src, dst)
+
+    def process_frame(self, frame):
+        if self.M is None or frame is None:
+            return None, None
+        birdseye = cv2.warpPerspective(frame, self.M, self.canvas_size)
+        gray = cv2.cvtColor(birdseye, cv2.COLOR_BGR2GRAY)
+        
+        thresh = cv2.adaptiveThreshold(gray, 255, 
+                                      cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                      cv2.THRESH_BINARY_INV, 11, 2)
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        opened = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel, iterations=1)
+        
+        contours, _ = cv2.findContours(opened, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        return birdseye, [cnt for cnt in contours if cv2.contourArea(cnt) > 200]
+
+class CVVisualizer:
+    def __init__(self, window_name="Street Mapper"):
+        self.window_name = window_name
+        self.calibration_points = []
+        self.is_calibrating = True
+        self.fps = 0
+        self.frame_count = 0
+        self.last_frame_time = time.time()
+        self.paused = False
+        
+        cv2.namedWindow(self.window_name, cv2.WINDOW_AUTOSIZE)
+        cv2.setMouseCallback(self.window_name, self._mouse_callback)
+
+    def _mouse_callback(self, event, x, y, flags, param):
+        if event == cv2.EVENT_LBUTTONDOWN and self.is_calibrating:
+            if len(self.calibration_points) < 4:
+                self.calibration_points.append((x, y))
+                print(f"校准点 {len(self.calibration_points)}/4: ({x}, {y})")
+                if len(self.calibration_points) == 4:
+                    self.is_calibrating = False
+                    print("校准完成！")
+
+    def draw_calibration_guide(self, frame):
+        if self.is_calibrating:
+            cv2.putText(frame, "点击图像四角进行校准 (左上→右上→右下→左下)", (20, 30),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+            for i, (x, y) in enumerate(self.calibration_points):
+                cv2.circle(frame, (x, y), 5, (0, 0, 255), -1)
+        return frame
+
+    def show_frame(self, frame, paused=False):
+        current_time = time.time()
+        elapsed = current_time - self.last_frame_time
+        self.frame_count += 1
+        if elapsed > 1:
+            self.fps = self.frame_count / elapsed
+            self.frame_count = 0
+            self.last_frame_time = current_time
+            cv2.putText(frame, f"FPS: {self.fps:.1f}", (20, 60),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
+        
+        if paused:
+            cv2.putText(frame, "已暂停 (按 P 键继续)", (20, 90),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+        
+        frame = self.draw_calibration_guide(frame)
+        cv2.imshow(self.window_name, frame)
+        key = cv2.waitKey(1)
+        if key == ord('p') or key == ord('P'):
+            self.paused = not self.paused
+            print(f"系统{'暂停' if self.paused else '恢复'}")
+        return key not in (27, ord('q'), ord('s'))
+
+    def close(self):
+        cv2.destroyAllWindows()
+
+class MapVisualizer:
+    def __init__(self, canvas_size=FRAME_SIZE):
+        self.canvas_size = canvas_size
+        self.fig, self.ax = plt.subplots(figsize=(8, 8))
+        
+        self.ax.set_xlim(0, canvas_size[0])
+        self.ax.set_ylim(canvas_size[1], 0)
+        self.ax.set_aspect('equal')
+        self.ax.set_facecolor('white')
+        self.ax.axis('off')
+        
+        plt.tight_layout(pad=0)
+        plt.ion()
+        plt.show()
+        
+        self.last_update = time.time()
+        self.paused = False
+
+    def update_map(self, contours, force_update=False):
+        if self.paused and not force_update:
+            return False
+        
+        current_time = time.time()
+        if not force_update and (current_time - self.last_update < MATPLOTLIB_UPDATE_INTERVAL):
+            return False
+        
+        self.ax.clear()
+        valid_contours = [cnt.squeeze() for cnt in contours if cv2.contourArea(cnt) > MIN_FILL_AREA]
+        
+        for cnt in valid_contours:
+            self.ax.plot(cnt[:, 0], cnt[:, 1], color=LINE_COLOR, linewidth=LINE_WIDTH)
+        
+        self._fill_nearby_regions(valid_contours)
+        
+        self.ax.set_xlim(0, self.canvas_size[0])
+        self.ax.set_ylim(self.canvas_size[1], 0)
+        self.ax.set_aspect('equal')
+        self.ax.axis('off')
+        
+        if self.paused:
+            self.ax.text(self.canvas_size[0]/2, self.canvas_size[1]/2, "PAUSED",
+                        fontsize=20, ha='center', va='center', bbox=dict(facecolor='white', alpha=0.8))
+        
+        self.fig.set_size_inches(self.canvas_size[0]/100, self.canvas_size[1]/100)
+        
+        plt.draw()
+        plt.pause(0.01)
+        self.last_update = current_time
+        return True
+
+    def _fill_nearby_regions(self, contours):
+        for i in range(len(contours)):
+            pts1 = contours[i]
+            for j in range(i+1, len(contours)):
+                pts2 = contours[j]
+                
+                dx = pts1[:, np.newaxis, 0] - pts2[:, 0]
+                dy = pts1[:, np.newaxis, 1] - pts2[:, 1]
+                dist_matrix = np.sqrt(dx**2 + dy**2)
+                min_dist = np.min(dist_matrix)
+                
+                if min_dist < MIN_LINE_DIST:
+                    path = np.vstack((pts1, pts2[::-1]))
+                    if len(path) >= 4:
+                        area = cv2.contourArea(path.reshape(-1, 1, 2))
+                        if area > MIN_FILL_AREA:
+                            self.ax.fill(path[:, 0], path[:, 1], color=FILL_COLOR, alpha=1.0)
+
+    def toggle_pause(self):
+        self.paused = not self.paused
+
+    def close(self):
+        plt.close(self.fig)
+
+if __name__ == "__main__":
+    print("系统启动...")
+    camera = RDKCamera()
+    pusher = FFmpegPusher()
+    mapper = StreetMapper()
+    cv_vis = CVVisualizer()
+    map_vis = MapVisualizer()
+    
+    desktop = os.path.join(os.path.expanduser("~"), "Desktop")
+    print(f"图片将保存至: {desktop}")
+    
+    time.sleep(2)
+    print("请在视频窗口中完成四角校准（左上→右上→右下→左下）")
+    print("提示: 校准完成后按 P 键可暂停/恢复图像更新，按 S 键保存当前地图")
+    
+    try:
+        calibration_complete = False
+        while True:
+            frame = camera.get_frame()
+            if frame is None:
+                continue
+            
+            if not calibration_complete:
+                key = cv_vis.show_frame(frame)
+                if key == ord('s'):
+                    calibration_path = os.path.join(desktop, "calibration_preview.png")
+                    map_vis.fig.savefig(calibration_path, dpi=100, bbox_inches='tight', pad_inches=0)
+                    print(f"校准预览已保存至桌面: {calibration_path}")
+                if not key:
+                    break
+                if len(cv_vis.calibration_points) == 4:
+                    mapper.calibrate(cv_vis.calibration_points)
+                    calibration_complete = True
+                    print("校准完成，开始分析街道")
+                continue
+            
+            current_paused = cv_vis.paused
+            map_vis.paused = current_paused
+            
+            birdseye, contours = mapper.process_frame(frame)
+            if birdseye is not None:
+                pusher.push_frame(birdseye)
+                key = cv_vis.show_frame(birdseye, paused=current_paused)
+                map_vis.update_map(contours, force_update=not current_paused)
+                
+                if key == ord('s') or key == ord('S'):
+                    street_map_path = os.path.join(desktop, "street_map.png")
+                    map_vis.fig.savefig(street_map_path, dpi=100, bbox_inches='tight', pad_inches=0)
+                    print(f"地图已保存至桌面: {street_map_path}")
+            
+            if cv2.getWindowProperty(cv_vis.window_name, cv2.WND_PROP_VISIBLE) < 1:
+                break
+
+    except KeyboardInterrupt:
+        print("\n用户中断程序")
+    finally:
+        camera.stop()
+        pusher.stop()
+        cv_vis.close()
+        map_vis.close()
+        print("系统退出")

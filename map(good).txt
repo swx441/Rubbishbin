@@ -1,0 +1,388 @@
+import socket
+import json
+import matplotlib.pyplot as plt
+import threading
+from queue import Queue
+import tkinter as tk
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
+from matplotlib.figure import Figure
+import numpy as np
+import warnings
+import time
+from sklearn.cluster import DBSCAN
+from sklearn.metrics import silhouette_score
+from collections import defaultdict
+from PIL import Image, ImageTk
+import cv2
+from tkinter import filedialog
+import os
+
+warnings.filterwarnings("ignore", category=UserWarning, module="matplotlib.font_manager")
+plt.rcParams["font.sans-serif"] = ["SimHei", "WenQuanYi Micro Hei", "Heiti TC", "Arial Unicode MS"]
+plt.rcParams["axes.unicode_minus"] = False
+
+HOST = "192.168.244.141"
+PORT = 8080
+
+CAMERA_WIDTH = 640   
+CAMERA_HEIGHT = 640  
+
+color_map = {'garbage': 'blue'}
+
+MARKER_SIZE = 80        
+TEXT_OFFSET = 0.03      
+UPDATE_INTERVAL = 500   
+AXIS_PADDING = 0.05     
+
+DBSCAN_EPS = 0.05       
+DBSCAN_MIN_SAMPLES = 2  
+TIME_HALF_LIFE = 5.0    
+MAX_AGE = 10.0          
+
+data_queue = Queue()
+all_points = {'garbage': {}}
+clustered_points = {}
+root = None
+is_paused = False
+cluster_score = "N/A"
+bg_image = None
+bg_extent = None
+original_window_size = None
+
+def camera_to_plot(x, y):
+    plot_x = (x / CAMERA_WIDTH) * 2 - 1
+    plot_y = 1 - (y / CAMERA_HEIGHT) * 2  
+    return plot_x, plot_y
+
+def receive_data(sock):
+    conn, addr = sock.accept()
+    print(f"连接来自: {addr}")
+    buffer = b""
+    
+    try:
+        while True:
+            data = conn.recv(1024)
+            if not data:
+                break
+            buffer += data
+            
+            while True:
+                try:
+                    json_str, _, buffer = buffer.partition(b'\n')
+                    if not json_str:
+                        break
+                    json_obj = json.loads(json_str.decode('utf-8'))
+                    if root and not root.winfo_exists():
+                        return
+                    root.after(0, data_queue.put, json_obj)
+                    print(f"已接收数据: {json_obj}")
+                except json.JSONDecodeError:
+                    break
+                    
+    except Exception as e:
+        print(f"接收数据时发生错误: {e}")
+    finally:
+        conn.close()
+
+def remove_old_points(points_dict):
+    current_time = time.time()
+    return {
+        point_id: point for point_id, point in points_dict.items()
+        if current_time - point['timestamp'] <= MAX_AGE
+    }
+
+def calculate_time_weight(timestamp, current_time=None):
+    if current_time is None:
+        current_time = time.time()
+    age = current_time - timestamp
+    return 2 ** (-age / TIME_HALF_LIFE)
+
+def enhanced_clustering(points_dict):
+    global cluster_score
+    if not points_dict:
+        cluster_score = "N/A"
+        return {}
+        
+    valid_points = remove_old_points(points_dict)
+    if not valid_points:
+        cluster_score = "N/A"
+        return {}
+    
+    coordinates = []
+    weights = []
+    for point_id, point in valid_points.items():
+        coordinates.append([point['x'], point['y']])
+        weights.append(calculate_time_weight(point['timestamp']))
+    
+    coordinates = np.array(coordinates)
+    weights = np.array(weights)
+    
+    dbscan = DBSCAN(eps=DBSCAN_EPS, min_samples=DBSCAN_MIN_SAMPLES)
+    labels = dbscan.fit_predict(coordinates)
+    
+    if len(set(labels)) > 1 and -1 not in labels:
+        try:
+            cluster_score = f"{silhouette_score(coordinates, labels):.2f}"
+        except:
+            cluster_score = "计算失败"
+    else:
+        cluster_score = "N/A"
+    
+    clusters = defaultdict(lambda: {'points': [], 'weights': []})
+    for i, (point_id, point) in enumerate(valid_points.items()):
+        label = labels[i]
+        if label == -1:
+            continue
+        clusters[label]['points'].append(point)
+        clusters[label]['weights'].append(weights[i])
+    
+    result = {}
+    for cluster_id, cluster in clusters.items():
+        points = cluster['points']
+        weights = cluster['weights']
+        sum_weights = sum(weights)
+        center_x = sum(p['x'] * w for p, w in zip(points, weights)) / sum_weights
+        center_y = sum(p['y'] * w for p, w in zip(points, weights)) / sum_weights
+        
+        x_coords = [p['x'] for p in points]
+        y_coords = [p['y'] for p in points]
+        cluster_size = max(np.std(x_coords), np.std(y_coords)) * 2
+        radius = cluster_size / 2
+        area = np.pi * (radius ** 2) if radius != 0 else 1
+        fill_rate = len(points) / area
+        
+        result[f"cluster_{cluster_id}"] = {
+            'x': center_x,
+            'y': center_y,
+            'color': color_map['garbage'],
+            'point_count': len(points),
+            'cluster_size': cluster_size,
+            'activity': sum(weights),
+            'fill_rate': fill_rate
+        }
+    
+    return result
+
+def toggle_pause():
+    global is_paused
+    is_paused = not is_paused
+    if is_paused:
+        pause_button.config(text="继续", bg="green")
+        status_label.config(text="系统状态: 已暂停")
+        save_button.config(state=tk.NORMAL)
+    else:
+        pause_button.config(text="暂停", bg="red")
+        status_label.config(text="系统状态: 正在运行")
+        save_button.config(state=tk.DISABLED)
+
+def save_current_plot():
+    if not is_paused:
+        status_label.config(text="系统状态: 必须先暂停才能保存")
+        return
+    
+    try:
+        desktop_path = os.path.join(os.path.expanduser("~"), "Desktop")
+        filename = f"garbage_visualization_{time.strftime('%Y%m%d_%H%M%S')}.png"
+        file_path = os.path.join(desktop_path, filename)
+        
+        original_axis_state = ax.axis()
+        ax.set_axis_off()
+        
+        fig.set_size_inches(6.4, 6.4)
+        plt.subplots_adjust(top=1, bottom=0, left=0, right=1, hspace=0, wspace=0)
+        fig.savefig(file_path, dpi=100, bbox_inches='tight', pad_inches=0)
+        
+        ax.axis(original_axis_state)
+        
+        status_label.config(text=f"已保存图片到桌面：{file_path}")
+        print(f"图片已保存：{file_path}")
+        
+    except Exception as e:
+        status_label.config(text=f"保存失败：{str(e)}")
+        print(f"保存图片失败：{e}")
+
+def load_background_image():
+    global bg_image, bg_extent, ax
+    file_path = filedialog.askopenfilename(filetypes=[("图像文件", "*.png;*.jpg;*.jpeg")])
+    if not file_path:
+        return
+    
+    try:
+        img = Image.open(file_path).resize((CAMERA_WIDTH, CAMERA_HEIGHT), Image.LANCZOS)
+        bg_image = np.array(img)
+        bg_extent = [-1, 1, -1, 1]
+        reset_view()
+        ax.imshow(bg_image, extent=bg_extent, aspect='equal', alpha=0.8, zorder=0)
+        canvas.draw()
+        status_label.config(text="背景图片已加载（640x640像素）")
+        
+    except Exception as e:
+        print(f"加载失败: {e}")
+        status_label.config(text="背景图片加载失败")
+
+def reset_view():
+    ax.set_xlim(-1, 1)
+    ax.set_ylim(-1, 1)
+    ax.set_aspect('equal', adjustable='box')
+    canvas.draw()
+
+def update_plot():
+    global all_points, clustered_points, ax, canvas, status_label
+    
+    try:
+        if not is_paused:
+            while not data_queue.empty():
+                json_data = data_queue.get()
+                trash_items = json_data.get('trash', [])
+                status_label.config(text=f"系统状态: 已接收 {len(trash_items)} 个垃圾数据")
+                
+                for i, trash in enumerate(trash_items):
+                    cam_x = trash.get('x', 0)
+                    cam_y = trash.get('y', 0)
+                    plot_x, plot_y = camera_to_plot(cam_x, cam_y)
+                    point_id = f"{plot_x}_{plot_y}_{time.time()}"
+                    all_points['garbage'][point_id] = {
+                        'x': plot_x,
+                        'y': plot_y,
+                        'timestamp': time.time(),
+                        'type': 'garbage'
+                    }
+            
+            clustered_points = enhanced_clustering(all_points['garbage'])
+        
+        ax.clear()
+        ax.set_title('垃圾位置可视化（640x640比例）')
+        ax.set_xlabel('X 坐标')
+        ax.set_ylabel('Y 坐标')
+        
+        status_text = "系统: " + ("已暂停" if is_paused else "运行中")
+        if cluster_score != "N/A":
+            status_text += f" | 聚类评分: {cluster_score}"
+        
+        ax.text(0.02, 0.02, status_text, transform=ax.transAxes, fontsize=9, 
+                bbox=dict(facecolor='white', alpha=0.5))
+        
+        ax.grid(True, linestyle='--', alpha=0.6)
+        ax.set_xlim(-1, 1)
+        ax.set_ylim(-1, 1)
+        ax.set_aspect('equal', adjustable='box')
+        
+        ax.axhline(y=0, color='gray', linestyle='-', alpha=0.3)
+        ax.axvline(x=0, color='gray', linestyle='-', alpha=0.3)
+        ax.text(0, 1.05, "上", ha='center', va='center', transform=ax.transAxes)
+        ax.text(0, -0.05, "下", ha='center', va='center', transform=ax.transAxes)
+        ax.text(1.05, 0, "右", ha='center', va='center', transform=ax.transAxes)
+        ax.text(-0.05, 0, "左", ha='center', va='center', transform=ax.transAxes)
+        
+        if bg_image is not None:
+            ax.imshow(bg_image, extent=bg_extent, aspect='equal', alpha=0.8, zorder=0)
+        
+        if clustered_points:
+            for cluster_id, cluster in clustered_points.items():
+                marker_size = MARKER_SIZE * (0.5 + min(1, cluster['activity'] / 5))
+                alpha = 0.5 + min(1, cluster['cluster_size'] / 0.5) * 0.5
+                
+                ax.scatter(cluster['x'], cluster['y'], color=cluster['color'], 
+                           s=marker_size, alpha=alpha, edgecolors='black', linewidths=1, marker='o')
+                
+                offset_y = TEXT_OFFSET * 1.5
+                ax.annotate(f"垃圾聚集点 {cluster_id.split('_')[1]}", 
+                            (cluster['x'] + TEXT_OFFSET, cluster['y'] + offset_y),
+                            fontsize=9, color='black', fontweight='bold')
+                
+                ax.annotate(f"点数: {cluster['point_count']} | 活跃度: {cluster['activity']:.1f}", 
+                            (cluster['x'] + TEXT_OFFSET, cluster['y']),
+                            fontsize=8, color='gray')
+                
+                ax.annotate(f"填充率: {cluster['fill_rate']:.2f} 点/单位²", 
+                            (cluster['x'] + TEXT_OFFSET, cluster['y'] - offset_y),
+                            fontsize=8, color='purple', bbox=dict(facecolor='white', alpha=0.7))
+                
+                ax.annotate(f"区域大小: {cluster['cluster_size']:.2f} 单位", 
+                            (cluster['x'] + TEXT_OFFSET, cluster['y'] - offset_y * 2),
+                            fontsize=7, color='blue')
+        
+        else:
+            ax.text(0, 0, "未接收到任何垃圾数据", ha='center', va='center', fontsize=12)
+        
+        legend_elements = [plt.Line2D([0], [0], marker='o', color='w', 
+                                      markerfacecolor='blue', markersize=10, label='垃圾聚集点')]
+        ax.legend(handles=legend_elements, loc='upper right')
+        
+        canvas.draw()
+    
+    except Exception as e:
+        print(f"更新绘图时发生错误: {e}")
+    
+    root.after(UPDATE_INTERVAL, update_plot)
+
+def on_window_resize(event):
+    ax.set_aspect('equal', adjustable='box')
+    ax.set_xlim(-1, 1)
+    ax.set_ylim(-1, 1)
+    canvas.draw()
+
+def main():
+    global root, ax, canvas, status_label, sock, pause_button, save_button, fig
+    
+    root = tk.Tk()
+    root.title("垃圾检测可视化系统（640x640比例）")
+    
+    control_frame = tk.Frame(root)
+    control_frame.pack(fill=tk.X, padx=10, pady=5)
+    
+    bg_btn = tk.Button(control_frame, text="加载背景图片", command=load_background_image, bg="#87CEEB")
+    bg_btn.pack(side=tk.LEFT, padx=5)
+    
+    reset_view_btn = tk.Button(control_frame, text="重置视图", command=reset_view, bg="#ADD8E6")
+    reset_view_btn.pack(side=tk.LEFT, padx=5)
+    
+    save_button = tk.Button(control_frame, text="保存图片", command=save_current_plot, bg="#4CAF50", fg="white", state=tk.DISABLED)
+    save_button.pack(side=tk.LEFT, padx=5)
+    
+    status_label = tk.Label(control_frame, text="系统状态: 等待数据...", font=("SimHei", 10))
+    status_label.pack(side=tk.RIGHT, padx=5)
+    
+    pause_button = tk.Button(control_frame, text="暂停", command=toggle_pause, bg="red", fg="white")
+    pause_button.pack(side=tk.RIGHT, padx=5)
+    
+    fig = Figure(figsize=(6.4, 6.4), dpi=100)
+    ax = fig.add_subplot(111)
+    fig.subplots_adjust(top=1, bottom=0.1, left=0.1, right=0.9, hspace=0, wspace=0)
+    canvas = FigureCanvasTkAgg(fig, master=root)
+    canvas.draw()
+    canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+    
+    toolbar = NavigationToolbar2Tk(canvas, root)
+    toolbar.update()
+    
+    root.bind('<Configure>', on_window_resize)
+    
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.bind((HOST, PORT))
+    sock.listen(1)
+    print("等待连接...")
+    
+    receive_thread = threading.Thread(target=receive_data, args=(sock,))
+    receive_thread.daemon = True
+    receive_thread.start()
+    
+    root.after(UPDATE_INTERVAL, update_plot)
+    
+    def on_closing():
+        print("关闭应用程序...")
+        root.destroy()
+    
+    root.protocol("WM_DELETE_WINDOW", on_closing)
+    
+    try:
+        root.mainloop()
+    except KeyboardInterrupt:
+        print("程序被中断")
+    finally:
+        if 'sock' in globals():
+            sock.close()
+        print("程序已退出")
+
+if __name__ == "__main__":
+    main()
